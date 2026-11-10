@@ -17,3 +17,4 @@ database_id = "c3c00b9b-fe5c-4baf-9bb0-d230b92be5bc"
 directory = "./public"
 binding = "ASSETS"
 run_worker_first = true
+html_handling = "none"
