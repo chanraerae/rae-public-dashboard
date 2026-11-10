@@ -1,4 +1,4 @@
-name = "rae-link-dashboard"
+name = "rae-public-dashboard"
 main = "src/index.js"
 compatibility_date = "2026-11-10"
 workers_dev = false
