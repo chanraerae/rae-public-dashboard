@@ -12,7 +12,7 @@ const domainOf = id => state.domains.find(d => d.id === id);
 const shortHost = s => { try { return new URL(s).hostname; } catch { return s; } };
 const isMatch = l => {
   const q = els.search.value.trim().toLowerCase();
-  return !q || [l.title,l.url,l.category,l.description,domainOf(l.domain_id)?.name,domainOf(l.domain_id)?.hostname].some(x => String(x || '').toLowerCase().includes(q));
+  return !q || [l.title,l.url,l.category,l.description,domainOf(l.domain_id)?.name,domainOf(l.domain_id)?.hostname,l.owner,l.platform,l.account_label,l.scope].some(x => String(x || '').toLowerCase().includes(q));
 };
 function sorted(items) {
   return [...items].sort(els.sort.value === 'recent'
@@ -21,7 +21,7 @@ function sorted(items) {
 }
 function tile(l) {
   const initial = l.title.trim().charAt(0).toUpperCase();
-  return `<article class="tile"><div class="tile-icon">${esc(initial)}</div><div class="tile-main"><a class="tile-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(l.title)}">${esc(l.title)} ↗</a><div class="tile-sub">${esc(shortHost(l.url))} · ${esc(l.category)}</div>${l.description ? `<div class="tile-desc">${esc(l.description)}</div>` : ''}</div><div class="tile-actions"><button class="mini ${l.favorite ? 'pinned' : ''}" data-action="favorite" data-id="${esc(l.id)}" title="${l.favorite?'Unpin':'Pin'} favorite" aria-label="${l.favorite?'Unpin':'Pin'} ${esc(l.title)}">${l.favorite ? '★' : '☆'}</button><button class="mini" data-action="edit" data-id="${esc(l.id)}" title="Edit link" aria-label="Edit ${esc(l.title)}">✎</button></div></article>`;
+  return `<article class="tile"><div class="tile-icon">${esc(initial)}</div><div class="tile-main"><a class="tile-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(l.title)}">${esc(l.title)} ↗</a><div class="tile-sub">${esc(l.platform || shortHost(l.url))} · ${esc(l.owner || 'Unassigned')}${l.account_label ? ' · '+esc(l.account_label) : ''} · ${esc(l.category)}</div>${l.description ? `<div class="tile-desc">${esc(l.description)}</div>` : ''}</div><div class="tile-actions"><button class="mini ${l.favorite ? 'pinned' : ''}" data-action="favorite" data-id="${esc(l.id)}" title="${l.favorite?'Unpin':'Pin'} favorite" aria-label="${l.favorite?'Unpin':'Pin'} ${esc(l.title)}">${l.favorite ? '★' : '☆'}</button><button class="mini" data-action="edit" data-id="${esc(l.id)}" title="Edit link" aria-label="Edit ${esc(l.title)}">✎</button></div></article>`;
 }
 function section(title, subtitle, items, key = '') {
   return `<section class="section"><div class="section-title"><h2>${esc(title)}</h2><span class="hint">${esc(subtitle)}</span></div><div class="link-grid">${sorted(items).map(tile).join('')}</div></section>`;
@@ -32,7 +32,7 @@ function render() {
   $('#count-domains').textContent = state.domains.length;
   $('#count-tools').textContent = state.links.filter(l=>l.kind==='tool').length;
   $('#count-favorites').textContent = state.links.filter(l=>l.favorite).length;
-  const views = {all:['Everything. One place','All your apps, websites, and online tools — organized your way.','OVERVIEW'],domains:['Your domains','All the projects and web apps connected to your domains.','MY DOMAINS'],tools:['Your online tools','Security, productivity, development, AI and everything in between.','ONLINE TOOLS'],favorites:['Your essentials','The links you reach for most, always one click away.','FAVORITES']};
+  const views = {all:['Everything. One place','All your apps, websites, and online tools — organized your way.','OVERVIEW'],domains:['Your domains','All the projects and web apps connected to your domains.','MY DOMAINS'],accounts:['Your accounts & pages','Personal profiles, your wife’s accounts, and business social pages — clearly separated.','ACCOUNTS & SOCIAL'],tools:['Your online tools','Security, productivity, development, AI and everything in between.','ONLINE TOOLS'],favorites:['Your essentials','The links you reach for most, always one click away.','FAVORITES']};
   const v = views[state.view];
   $('#page-title').innerHTML = `${esc(v[0])}<span class="accent">.</span>`;
   $('#page-description').textContent = v[1]; $('#crumb').textContent = v[2];
@@ -41,6 +41,14 @@ function render() {
   if (state.view === 'favorites') {
     const favorites = filtered.filter(l=>l.favorite);
     html = favorites.length ? section('Pinned links',`${favorites.length} links`,favorites) : empty('No pinned links', 'Tap the star on any link to pin it here.');
+  } else if (state.view === 'accounts') {
+    const accounts = filtered.filter(l => ['personal','social','business'].includes(l.scope));
+    const owners = [...new Set(accounts.map(l => l.owner.trim() || 'Unassigned'))].sort((a,b)=>a.localeCompare(b));
+    html = owners.map(owner => {
+      const group = accounts.filter(l => (l.owner.trim() || 'Unassigned') === owner);
+      const platforms = [...new Set(group.map(l => l.platform.trim() || 'Other links'))].sort((a,b)=>a.localeCompare(b));
+      return `<div class="account-heading"><h2>${esc(owner)}</h2><span>${group.length} links</span></div>` + platforms.map(platform => section(platform, `${group.filter(l => (l.platform.trim() || 'Other links') === platform).length} links`, group.filter(l => (l.platform.trim() || 'Other links') === platform))).join('');
+    }).join('') || empty('No accounts yet','Add a link, select Personal, Social accounts & pages, or Business, and choose an owner and platform.');
   } else if (state.view === 'tools') {
     const tools = filtered.filter(l=>l.kind==='tool');
     const cats = [...new Set(tools.map(l=>l.category))].sort();
@@ -54,9 +62,11 @@ function render() {
       const favorites = filtered.filter(l=>l.favorite);
       if (favorites.length) html += section('★ Quick access',`${favorites.length} pinned`,favorites);
       for (const {d,links} of grouped) if (links.length) html += section(d.name,d.hostname,links);
-      const ungrouped = filtered.filter(l=>!l.domain_id && l.kind!=='tool');
+      const ungrouped = filtered.filter(l=>!l.domain_id && l.kind!=='tool' && l.scope==='general');
       if (ungrouped.length) html += section('General apps',`${ungrouped.length} links`,ungrouped);
-      const tools = filtered.filter(l=>l.kind==='tool');
+      const accounts = filtered.filter(l => ['personal','social','business'].includes(l.scope) && !l.domain_id);
+      if (accounts.length) html += section('Accounts & social', `${accounts.length} profiles and pages`, accounts);
+      const tools = filtered.filter(l=>l.kind==='tool' && l.scope==='general');
       if (tools.length) html += section('Online tools',`${tools.length} tools`,tools);
       if (!html) html = empty(state.links.length ? 'No matching links':'Your dashboard is ready',state.links.length ? 'Try a different search.':'Add your domains and first links to get started.');
     }
@@ -83,9 +93,9 @@ function openLink(l, domainId = '') {
   els.linkForm.reset();
   $('#link-modal-title').textContent = l ? 'Edit link' : 'Add a link';
   $('#delete-link').hidden = !l;
-  for (const k of ['id','title','url','description','kind','domain_id','category']) {
+  for (const k of ['id','title','url','description','kind','domain_id','category','scope','owner','platform','account_label']) {
     const element = els.linkForm.elements.namedItem(k);
-    element.value = l?.[k] ?? (k==='domain_id' ? domainId : (k==='kind' ? 'app' : ''));
+    element.value = l?.[k] ?? (k==='domain_id' ? domainId : (k==='kind' ? 'app' : (k==='scope' ? 'general' : '')));
   }
   els.linkForm.elements.favorite.checked = Boolean(l?.favorite);
   els.linkDialog.showModal();
