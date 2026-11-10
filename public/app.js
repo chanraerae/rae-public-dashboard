@@ -6,7 +6,7 @@ const els = {
   linkDialog: $('#link-dialog'), linkForm: $('#link-form'), domainDialog: $('#domain-dialog'),
   domainForm: $('#domain-form'), domainList: $('#domain-list'), linkDomain: $('#link-domain'),
 };
-let state = { domains: [], links: [], view: 'all' };
+let state = { domains: [], links: [], view: 'all', explorer: { entries: [], runs: [], configured: false } }; 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const domainOf = id => state.domains.find(d => d.id === id);
 const shortHost = s => { try { return new URL(s).hostname; } catch { return s; } };
@@ -32,13 +32,15 @@ function render() {
   $('#count-domains').textContent = state.domains.length;
   $('#count-tools').textContent = state.links.filter(l=>l.kind==='tool').length;
   $('#count-favorites').textContent = state.links.filter(l=>l.favorite).length;
-  const views = {all:['Everything. One place','All your apps, websites, and online tools — organized your way.','OVERVIEW'],domains:['Your domains','All the projects and web apps connected to your domains.','MY DOMAINS'],accounts:['Your accounts & pages','Personal profiles, your wife’s accounts, and business social pages — clearly separated.','ACCOUNTS & SOCIAL'],tools:['Your online tools','Security, productivity, development, AI and everything in between.','ONLINE TOOLS'],favorites:['Your essentials','The links you reach for most, always one click away.','FAVORITES']};
+  const views = {all:['Everything. One place','All your apps, websites, and online tools — organized your way.','OVERVIEW'],domains:['Your domains','All the projects and web apps connected to your domains.','MY DOMAINS'],accounts:['Your accounts & pages','Personal profiles, your wife’s accounts, and business social pages — clearly separated.','ACCOUNTS & SOCIAL'],explorer:['Domain Explorer','Discover Cloudflare DNS, Worker routes, Pages projects and deployed scripts.','DOMAIN EXPLORER'],tools:['Your online tools','Security, productivity, development, AI and everything in between.','ONLINE TOOLS'],favorites:['Your essentials','The links you reach for most, always one click away.','FAVORITES']};
   const v = views[state.view];
   $('#page-title').innerHTML = `${esc(v[0])}<span class="accent">.</span>`;
   $('#page-description').textContent = v[1]; $('#crumb').textContent = v[2];
   const filtered = state.links.filter(isMatch);
   let html = '';
-  if (state.view === 'favorites') {
+  if (state.view === 'explorer') {
+    html = renderExplorer();
+  } else if (state.view === 'favorites') {
     const favorites = filtered.filter(l=>l.favorite);
     html = favorites.length ? section('Pinned links',`${favorites.length} links`,favorites) : empty('No pinned links', 'Tap the star on any link to pin it here.');
   } else if (state.view === 'accounts') {
@@ -75,6 +77,36 @@ function render() {
   els.linkDomain.innerHTML = '<option value="">No domain / General</option>' + state.domains.map(d=>`<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.hostname)})</option>`).join('');
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===state.view));
 }
+
+function renderExplorer() {
+  const {entries,runs,configured}=state.explorer;
+  const latest=runs[0];
+  let out=`<div class="explorer-controls"><div><b>Cloudflare inventory</b><p>Read-only discovery of configured DNS, Worker routes and Pages. Not a complete crawl of every private URL.</p></div><button class="primary" id="scan-explorer" ${configured?'':'disabled'}>${configured?'↻ Scan Cloudflare':'Configure API token first'}</button></div>`;
+  if (latest) {
+    out+=`<div class="explorer-run">Last scan: ${esc(latest.started_at)} · ${esc(latest.status)} · ${Number(latest.items_found)||0} found · ${Number(latest.new_items)||0} new`;
+    try { const warnings=JSON.parse(latest.warnings || '[]'); if(warnings.length) out+=`<details><summary>${warnings.length} API warning(s) — partial results possible</summary><ul>${warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul></details>`; } catch {}
+    out+='</div>';
+  }
+  if(!configured) out+='<p class="explorer-run">Configure the CF_DISCOVERY_TOKEN secret and CF_ACCOUNT_ID variable on the Worker, then refresh this page.</p>';
+  if (!entries.length) return out+empty('No discoveries yet','Configure Cloudflare credentials, then choose Scan Cloudflare.');
+  const q=els.search.value.toLowerCase().trim();
+  const shown=entries.filter(x=>!q||[x.hostname,x.zone_name,x.name,x.source,x.path,x.details].some(y=>String(y||'').toLowerCase().includes(q)));
+  const groups=[...new Set(shown.map(x=>x.zone_name||'Account-level / unassigned'))].sort();
+  for(const group of groups) {
+    const records=shown.filter(x=>(x.zone_name||'Account-level / unassigned')===group);
+    out+=`<section class="section"><div class="section-title"><h2>${esc(group)}</h2><span class="hint">${records.length} entries</span></div><div class="explorer-list">`;
+    for(const r of records) {
+      out+=`<div class="explorer-row"><div><span class="explorer-type">${esc(r.source)}</span> <b>${esc(r.hostname||r.name||'Route pattern')}</b>${r.path?` <span class="muted">${esc(r.path)}</span>`:''}<small>${esc(r.details||'')}</small></div><div class="explorer-actions">${r.url?`<a class="ghost small" href="${esc(r.url)}" rel="noopener noreferrer" target="_blank">Open ↗</a>`:''}${r.url?`<button class="ghost small" data-discovery-import="${esc(r.id)}" ${r.imported_link_id?'disabled':''}>${r.imported_link_id?'Imported':'+ Save link'}</button>`:''}</div></div>`;
+    }
+    out+='</div></section>';
+  }
+  return out||empty('No matches','Try another search.');
+}
+async function loadExplorer() {
+  try {state.explorer=await api('/api/explorer');render();}
+  catch(e){notice(`Domain Explorer: ${e.message}`);}
+}
+
 function notice(message) { els.notice.textContent = message; els.notice.hidden = false; }
 function clearNotice() { els.notice.hidden = true; }
 async function api(path, method = 'GET', body) {
@@ -108,11 +140,22 @@ function renderDomains() {
 function resetDomain() { els.domainForm.reset(); els.domainForm.elements.id.value=''; $('#domain-submit').textContent='Add domain'; }
 $('#add-link').addEventListener('click',()=>openLink());
 $('#manage-domains').addEventListener('click',openDomains);
-$('#nav').addEventListener('click', e=>{const btn=e.target.closest('[data-view]');if(!btn)return;state.view=btn.dataset.view;render();});
+$('#nav').addEventListener('click', e=>{const btn=e.target.closest('[data-view]');if(!btn)return;state.view=btn.dataset.view;render();if(state.view==='explorer')loadExplorer();});
 els.search.addEventListener('input',render); els.sort.addEventListener('change',render);
 window.addEventListener('keydown',e=>{if(e.key==='/'&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!document.querySelector('dialog[open]')){e.preventDefault();els.search.focus();}});
 document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',()=>b.closest('dialog').close()));
 els.sections.addEventListener('click', async e=>{
+  if(e.target.closest('#scan-explorer')) {
+    const button=e.target.closest('#scan-explorer');button.disabled=true;button.textContent='Scanning…';
+    try {const result=await api('/api/explorer/scan','POST',{});await loadExplorer();notice(`Discovery ${result.status}: ${result.found} entries, ${result.new_items} new. ${result.warnings.length} warning(s).`);} catch(err){notice(err.message);button.disabled=false;button.textContent='↻ Scan Cloudflare';}
+    return;
+  }
+  const importButton=e.target.closest('[data-discovery-import]');
+  if(importButton){
+    try {const record=state.explorer.entries.find(x=>x.id===importButton.dataset.discoveryImport);const title=prompt('Save link as:',record?.hostname||record?.name||'Discovered application');if(!title)return;
+      await api('/api/explorer/import','POST',{id:importButton.dataset.discoveryImport,title});await refresh();await loadExplorer();notice('Link saved to your workspace.');}
+    catch(err){notice(err.message);}return;
+  }
   const b=e.target.closest('[data-action]');if(!b)return;
   const id=b.dataset.id, l=state.links.find(x=>x.id===id);
   if(b.dataset.action==='edit') return openLink(l);
