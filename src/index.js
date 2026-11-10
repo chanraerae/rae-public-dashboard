@@ -55,6 +55,10 @@ async function handleAPI(request, env, path) {
       const description = trim(body.description, 500);
       const favorite = body.favorite ? 1 : 0;
       const domainId = trim(body.domain_id, 36) || null;
+      const scope = ['general','personal','business','social'].includes(body.scope) ? body.scope : 'general';
+      const owner = trim(body.owner, 100);
+      const platform = trim(body.platform, 100);
+      const accountLabel = trim(body.account_label, 120);
       if (!title || !validURL(url)) return bad('Enter a title and an http(s) URL.');
       if (domainId) {
         const domain = await env.DB.prepare('SELECT id FROM domains WHERE id=?').bind(domainId).first();
@@ -62,13 +66,13 @@ async function handleAPI(request, env, path) {
       }
       if (method === 'POST') {
         const id = crypto.randomUUID();
-        await env.DB.prepare('INSERT INTO links (id,title,url,description,kind,domain_id,category,favorite) VALUES (?,?,?,?,?,?,?,?)')
-          .bind(id, title, url, description, kind, domainId, category, favorite).run();
+        await env.DB.prepare('INSERT INTO links (id,title,url,description,kind,domain_id,category,favorite,scope,owner,platform,account_label) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+          .bind(id, title, url, description, kind, domainId, category, favorite, scope, owner, platform, accountLabel).run();
         return json({ id }, 201);
       }
       const id = trim(body.id, 36);
-      const result = await env.DB.prepare('UPDATE links SET title=?,url=?,description=?,kind=?,domain_id=?,category=?,favorite=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
-        .bind(title, url, description, kind, domainId, category, favorite, id).run();
+      const result = await env.DB.prepare('UPDATE links SET title=?,url=?,description=?,kind=?,domain_id=?,category=?,favorite=?,scope=?,owner=?,platform=?,account_label=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
+        .bind(title, url, description, kind, domainId, category, favorite, scope, owner, platform, accountLabel, id).run();
       return result.meta.changes ? json({ ok: true }) : bad('Link not found.', 404);
     }
     const linkMatch = path.match(/^\/api\/links\/([0-9a-f-]{36})$/);
