@@ -21,6 +21,34 @@ async function handleAPI(request, env, path) {
     catch { return bad('Malformed JSON.'); }
   }
   try {
+    if (path === '/api/explorer' && method === 'GET') {
+      const result = await env.DB.prepare('SELECT * FROM discovered_endpoints ORDER BY zone_name, hostname, source, path').all();
+      const meta = await env.DB.prepare('SELECT * FROM discovery_runs ORDER BY started_at DESC LIMIT 5').all();
+      return json({ entries: result.results, runs: meta.results, configured: Boolean(env.CF_DISCOVERY_TOKEN && env.CF_ACCOUNT_ID) });
+    }
+    if (path === '/api/explorer/scan' && method === 'POST') {
+      if (!env.CF_DISCOVERY_TOKEN || !env.CF_ACCOUNT_ID) return bad('Set CF_DISCOVERY_TOKEN (secret) and CF_ACCOUNT_ID (variable) in the Worker first.', 503);
+      return json(await scanCloudflare(env));
+    }
+    if (path === '/api/explorer/import' && method === 'POST') {
+      const id = trim(body.id, 36);
+      const entry = await env.DB.prepare('SELECT * FROM discovered_endpoints WHERE id=?').bind(id).first();
+      if (!entry) return bad('Discovered entry not found.', 404);
+      if (!entry.url || !validURL(entry.url)) return bad('This entry has no actionable URL.', 400);
+      let domainId = null;
+      if (entry.zone_name) {
+        const d = await env.DB.prepare('SELECT id FROM domains WHERE hostname=?').bind(entry.zone_name).first();
+        domainId = d?.id || null;
+      }
+      const existing = await env.DB.prepare('SELECT id FROM links WHERE url=? LIMIT 1').bind(entry.url).first();
+      if (existing) return bad('This URL is already saved in your dashboard.', 409);
+      const title = trim(body.title, 120) || entry.hostname || entry.name || 'Discovered application';
+      const linkId = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO links (id,title,url,description,kind,domain_id,category,favorite,scope,owner,platform,account_label) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(linkId,title,entry.url,`Cloudflare discovery: ${entry.source}`, 'app',domainId,'Cloudflare',0,'general','','','').run();
+      await env.DB.prepare('UPDATE discovered_endpoints SET imported_link_id=? WHERE id=?').bind(linkId,id).run();
+      return json({ id: linkId },201);
+    }
     if (path === '/api/data' && method === 'GET') {
       const [domains, links] = await Promise.all([
         env.DB.prepare('SELECT * FROM domains ORDER BY name COLLATE NOCASE').all(),
@@ -85,6 +113,111 @@ async function handleAPI(request, env, path) {
     if (/UNIQUE constraint failed/i.test(String(e))) return bad('That hostname is already saved.', 409);
     console.error(e);
     return bad('The database operation failed.', 500);
+  }
+}
+
+
+const CF_API = 'https://api.cloudflare.com/client/v4';
+async function cfList(env, path, warnings, label, maxPages = 10) {
+  const items = [];
+  let page = 1;
+  while (page <= maxPages) {
+    const u = new URL(CF_API + path);
+    u.searchParams.set('page', String(page));
+    u.searchParams.set('per_page', '100');
+    let res, data;
+    try {
+      res = await fetch(u, { headers: { Authorization: `Bearer ${env.CF_DISCOVERY_TOKEN}`, Accept: 'application/json' }, signal: AbortSignal.timeout(15000) });
+      data = await res.json();
+    } catch (e) { warnings.push(`${label}: request failed (${String(e).slice(0,120)})`); return null; }
+    if (!res.ok || !data.success) {
+      warnings.push(`${label}: API ${res.status} ${Array.isArray(data.errors) ? data.errors.map(x=>x.message).join('; ').slice(0,180) : 'permission or request error'}`);
+      return null;
+    }
+    const result = Array.isArray(data.result) ? data.result : (Array.isArray(data.result?.result) ? data.result.result : []);
+    items.push(...result);
+    const count = data.result_info?.total_pages;
+    if (count && page >= count || result.length < 100) break;
+    page++;
+  }
+  if (page > maxPages) warnings.push(`${label}: truncated after ${maxPages * 100} items.`);
+  return items;
+}
+function zoneFor(host, names) {
+  return names.find(z => host === z || host.endsWith('.' + z)) || '';
+}
+function safeHost(value) {
+  const s = String(value || '').toLowerCase().replace(/^\*\./,'').replace(/\.$/,'');
+  return goodHostname(s) ? s : '';
+}
+async function scanCloudflare(env) {
+  const runId = crypto.randomUUID();
+  const warnings = [];
+  await env.DB.prepare('INSERT INTO discovery_runs (id,status) VALUES (?,?)').bind(runId,'running').run();
+  try {
+    const zones = await cfList(env,'/zones',warnings,'Zones');
+    if (!zones) throw new Error('Could not list zones. Check Zone Read permission.');
+    const zoneNames = zones.map(z=>z.name).sort((a,b)=>b.length-a.length);
+    const found = new Map();
+    const add = (type, host, zone, name, path, url, details) => {
+      if (found.size >= 1500) return;
+      const key = `${type}|${host}|${path}|${name}`;
+      if (!found.has(key)) found.set(key,{type,host,zone,name,path,url,details});
+    };
+    for (const zone of zones.slice(0,50)) {
+      const dns = await cfList(env,`/zones/${zone.id}/dns_records`,warnings,`DNS ${zone.name}`);
+      for (const r of dns || []) {
+        if (!['A','AAAA','CNAME'].includes(r.type)) continue;
+        const host = safeHost(r.name);
+        if (!host) continue;
+        add('dns',host,zone.name,r.type,'',`https://${host}/`,`${r.type} record (not proof that an app is online)`);
+      }
+      const routes = await cfList(env,`/zones/${zone.id}/workers/routes`,warnings,`Worker routes ${zone.name}`);
+      for (const r of routes || []) {
+        // A wildcard route is a route pattern, not an independently verified endpoint.
+        const pattern = String(r.pattern || '');
+        const host = safeHost(pattern.replace(/^https?:\/\//,'').split('/')[0]);
+        if (!host || pattern.includes('*')) {
+          add('route','',zone.name,r.script || 'Worker route',pattern,'',`Route pattern: ${pattern}`);
+        } else {
+          const pathPart = '/' + pattern.replace(/^https?:\/\//,'').split('/').slice(1).join('/');
+          add('route',host,zone.name,r.script || 'Worker route',pathPart,`https://${host}${pathPart}`,`Worker route: ${pattern}`);
+        }
+      }
+    }
+    if (zones.length > 50) warnings.push('Zone listing limited to the first 50 zones.');
+    const account = encodeURIComponent(String(env.CF_ACCOUNT_ID));
+    const pages = await cfList(env,`/accounts/${account}/pages/projects`,warnings,'Pages projects');
+    for (const p of pages || []) {
+      for (const domain of [p.subdomain,...(p.domains || [])]) {
+        const host=safeHost(domain);
+        if (host) add('pages',host,zoneFor(host,zoneNames),p.name || 'Pages project','/',`https://${host}/`,'Pages project hostname');
+      }
+    }
+    const workers = await cfList(env,`/accounts/${account}/workers/scripts`,warnings,'Workers scripts');
+    for (const w of workers || []) {
+      if (w.id) add('worker','', '', String(w.id),'','', 'Deployed Worker script (no hostname inferred)');
+    }
+    // Never erase old discoveries: upsert, record when last seen.
+    let added=0;
+    for (const x of found.values()) {
+      const key = [x.type,x.host,x.zone,x.name,x.path].join('|');
+      const id = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key)))).slice(0,16).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const existing=await env.DB.prepare('SELECT id FROM discovered_endpoints WHERE id=?').bind(id).first();
+      if (!existing) added++;
+      await env.DB.prepare(`INSERT INTO discovered_endpoints (id,source,hostname,zone_name,name,path,url,details,last_seen,first_seen)
+        VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET details=excluded.details, url=excluded.url, last_seen=CURRENT_TIMESTAMP`)
+        .bind(id,x.type,x.host,x.zone,x.name,x.path,x.url,x.details).run();
+    }
+    const status=warnings.length?'partial':'completed';
+    await env.DB.prepare('UPDATE discovery_runs SET status=?,finished_at=CURRENT_TIMESTAMP,items_found=?,new_items=?,warnings=? WHERE id=?')
+      .bind(status,found.size,added,JSON.stringify(warnings.slice(0,30)),runId).run();
+    return {status,found:found.size,new_items:added,warnings:warnings.slice(0,30)};
+  } catch(e) {
+    await env.DB.prepare('UPDATE discovery_runs SET status=?,finished_at=CURRENT_TIMESTAMP,warnings=? WHERE id=?')
+      .bind('failed',JSON.stringify([...warnings,String(e)].slice(0,30)),runId).run();
+    return {status:'failed',found:0,new_items:0,warnings:[...warnings,String(e)]};
   }
 }
 
